@@ -1006,6 +1006,138 @@ impl CFGR {
         self.sysclk(216.MHz())
     }
 
+    /// Return a `Clocks` struct based off the current RCC clock registers,
+    /// without changing any of them.
+    ///
+    /// This is useful when other code (either non-Rust or outside the current
+    /// binary) has already set up the clocks, so they can't be safely changed,
+    /// but a Clocks instance is still required for e.g. setting up other HAL
+    /// peripherals.
+    ///
+    /// Caution: This still uses the .hse and .lse entries in CFGR!  There's no
+    /// other way to get the external clocks' frequencies.
+    pub fn adopt_registers(self) -> Clocks {
+        // From the refman:
+        //
+        // sysclk <- (SW bits)*HSI,HSE,PLL
+        //   HSI <- 16MHz RC
+        //   HSE <- 4-26MHz HSE OSC
+        //   PLL <- /P <- *N <- /M <- *HSI,HSE
+        //
+        // pclk1 <- apb1_prescaler <- sysclk
+        // pclk2 <- apb2_prescaler <- sysclk
+        //
+        // hclk <- AHB_prescaler <- sysclk
+        //
+        // timclk1 <- (TIMPRE)*2,*4(cap_to_216) <- apb1_prescaler
+        // s/1/2
+        //
+        // src <- pllcfgr.pllsrc ? HSE : 16MHz_HSI
+        // if dckcfgr2.ck48msel {
+        //   pll48 = src * pllsaicfgr.pllsain / pllsaicfgr.pllsaip / pllcfgr.pllm
+        // } else {
+        //   pll48 = src * pllcfgr.plln / pllcfgr.pllm / pllcfgr.pllq
+        // }
+        // pll48clk_valid <- is pll48 == 48MHz +/- 120kHz?
+        //
+        // hse: given by the caller
+        // lse: given by the caller
+        //
+        // lsi: if csr.lsion, 32khz, else None
+        let rcc = unsafe { &(*RCC::ptr()) };
+        let cfgr = rcc.cfgr.read();
+
+        let hpre_divisor = match cfgr.hpre().bits() {
+            0..=7 => 1,
+            8 => 2,
+            9 => 4,
+            10 => 8,
+            11 => 16,
+            12 => 64,
+            13 => 128,
+            14 => 256,
+            15 => 512,
+            _ => panic!("invalid 4-bit field bit pattern"),
+        };
+        let get_divisor = |bits| match bits {
+            0..=3 => 1,
+            4 => 2,
+            5 => 4,
+            6 => 8,
+            7 => 16,
+            _ => panic!("invalid 3-bit field bit pattern"),
+        };
+        let apb1_divisor = get_divisor(cfgr.ppre1().bits());
+        let apb2_divisor = get_divisor(cfgr.ppre2().bits());
+        let pllcfgr = rcc.pllcfgr.read();
+        let get_pll_base_clk = || {
+            (if pllcfgr.pllsrc().bit_is_set() {
+                self.hse.unwrap().freq
+            } else {
+                HSI_FREQUENCY
+            }) / u32::from(pllcfgr.pllm().bits())
+        };
+
+        let sysclk = if cfgr.sw().is_hse() {
+            self.hse.unwrap().freq
+        } else if cfgr.sw().is_hsi() {
+            HSI_FREQUENCY
+        } else {
+            get_pll_base_clk() * pllcfgr.plln().bits().into() / (u32::from(pllcfgr.pllp().bits() + 1) * 2)
+        };
+
+        let timpre = rcc.dckcfgr1.read().timpre().bit_is_set();
+        let mut timclk1 = if timpre {
+            match apb1_divisor {
+                1..=4 => sysclk / hpre_divisor,
+                _ => 4 * sysclk / apb1_divisor,
+            }
+        } else {
+            match apb1_divisor {
+                1 => sysclk,
+                _ => 2 * sysclk / apb1_divisor,
+            }
+        };
+        let mut timclk2 = if timpre {
+            match apb2_divisor {
+                1..=4 => sysclk / hpre_divisor,
+                _ => 4 * sysclk / apb2_divisor,
+            }
+        } else {
+            match apb2_divisor {
+                1 => sysclk,
+                _ => 2 * sysclk / apb1_divisor,
+            }
+        };
+        if timclk1.to_Hz() > 216_000_000 {
+            timclk1 = Hertz::MHz(216);
+        }
+        if timclk2.to_Hz() > 216_000_000 {
+            timclk2 = Hertz::MHz(216);
+        }
+
+        let pll_base_clk = get_pll_base_clk();
+        let pll48 = if rcc.dckcfgr2.read().ck48msel().bit_is_set() {
+            let pllsaicfgr = rcc.pllsaicfgr.read();
+            pll_base_clk * pllsaicfgr.pllsain().bits().into() / (u32::from(pllsaicfgr.pllsaip().bits() + 1) * 2)
+        } else {
+            pll_base_clk * pllcfgr.plln().bits().into() / u32::from(pllcfgr.pllq().bits())
+        };
+        let pll48clk_valid = pll48 > Hertz::kHz(48_000 - 120) && pll48 < Hertz::kHz(48_000 + 120);
+        Clocks{
+            hclk: sysclk / hpre_divisor,
+            pclk1: sysclk / apb1_divisor,
+            pclk2: sysclk / apb2_divisor,
+            sysclk,
+            timclk1,
+            timclk2,
+            pll48clk_valid,
+            hse: self.hse.map(|hse| hse.freq),
+            lse: self.lse.map(|lse| lse.freq),
+            lsi: if rcc.csr.read().lsion().bit_is_set() { Some(32768_u32.Hz()) } else { None },
+        }
+    }
+
     /// Configure the "mandatory" clocks (`sysclk`, `hclk`, `pclk1` and `pclk2')
     /// and return them via the `Clocks` struct.
     ///
